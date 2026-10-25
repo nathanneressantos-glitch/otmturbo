@@ -1,0 +1,582 @@
+-- ⚡ TURBO BROOK v1 - Otimizador para Brookhaven
+-- FPS/Ping ao vivo, Anti Pulo, Modo Batata, Anti-Lag e mais
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Stats = game:GetService("Stats")
+local VirtualUser = game:GetService("VirtualUser")
+local LocalPlayer = Players.LocalPlayer
+
+-- Evita abrir duas vezes
+local guiParent = LocalPlayer:WaitForChild("PlayerGui")
+if guiParent:FindFirstChild("TurboBrook") then
+    guiParent.TurboBrook:Destroy()
+end
+
+local Features = {}      -- setters de cada função (para restaurar tudo)
+local Connections = {}   -- conexões para limpar ao fechar
+local Running = true
+
+-- ========================
+-- CORES
+-- ========================
+local C = {
+    bg = Color3.fromRGB(18, 18, 24),
+    header = Color3.fromRGB(26, 26, 36),
+    row = Color3.fromRGB(30, 30, 40),
+    accent = Color3.fromRGB(0, 200, 255),
+    on = Color3.fromRGB(0, 200, 120),
+    off = Color3.fromRGB(55, 55, 65),
+    text = Color3.fromRGB(230, 230, 235),
+    good = Color3.fromRGB(0, 230, 120),
+    mid = Color3.fromRGB(255, 200, 0),
+    bad = Color3.fromRGB(255, 70, 70)
+}
+
+-- ========================
+-- ANTI PULO
+-- ========================
+local jumpOriginal = {UseJumpPower = true, JumpPower = 50, JumpHeight = 7.2}
+local antiPulo = false
+
+local function ApplyAntiPulo()
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    pcall(function()
+        if antiPulo then
+            hum.UseJumpPower = true
+            hum.JumpPower = 0
+            hum.JumpHeight = 0
+            hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+        else
+            hum.UseJumpPower = jumpOriginal.UseJumpPower
+            hum.JumpPower = jumpOriginal.JumpPower
+            hum.JumpHeight = jumpOriginal.JumpHeight
+            hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+        end
+    end)
+end
+
+Features.AntiPulo = function(state)
+    if state and not antiPulo then
+        -- salva valores originais antes de travar
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            jumpOriginal.UseJumpPower = hum.UseJumpPower
+            jumpOriginal.JumpPower = hum.JumpPower > 0 and hum.JumpPower or 50
+            jumpOriginal.JumpHeight = hum.JumpHeight > 0 and hum.JumpHeight or 7.2
+        end
+    end
+    antiPulo = state
+    ApplyAntiPulo()
+end
+
+table.insert(Connections, LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.6)
+    if antiPulo then ApplyAntiPulo() end
+end))
+
+-- Reforço: se o jogo tentar liberar o pulo, trava de novo
+table.insert(Connections, UserInputService.JumpRequest:Connect(function()
+    if antiPulo then
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.Jump = false
+            if hum.JumpPower ~= 0 then ApplyAntiPulo() end
+        end
+    end
+end))
+
+-- ========================
+-- OTIMIZAÇÃO (efeitos / sombras / partículas)
+-- ========================
+local lightOriginal = nil
+local postOriginal = {}
+local fxOriginal = {}
+local fxConn = nil
+
+local function IsFx(obj)
+    return obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Smoke")
+        or obj:IsA("Fire") or obj:IsA("Sparkles") or obj:IsA("Beam")
+end
+
+Features.Otimizar = function(state)
+    pcall(function()
+        if state then
+            lightOriginal = {
+                GlobalShadows = Lighting.GlobalShadows,
+                FogEnd = Lighting.FogEnd,
+                FogStart = Lighting.FogStart,
+                Quality = settings().Rendering.QualityLevel
+            }
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 1e9
+
+            postOriginal = {}
+            for _, v in ipairs(Lighting:GetChildren()) do
+                if v:IsA("PostEffect") or v:IsA("Atmosphere") then
+                    postOriginal[v] = v:IsA("PostEffect") and v.Enabled or nil
+                    if v:IsA("PostEffect") then v.Enabled = false end
+                end
+            end
+
+            fxOriginal = {}
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if IsFx(obj) then
+                    fxOriginal[obj] = obj.Enabled
+                    obj.Enabled = false
+                end
+            end
+
+            -- desliga efeitos novos que aparecerem
+            fxConn = workspace.DescendantAdded:Connect(function(obj)
+                if IsFx(obj) then
+                    task.defer(function()
+                        pcall(function()
+                            fxOriginal[obj] = obj.Enabled
+                            obj.Enabled = false
+                        end)
+                    end)
+                end
+            end)
+        else
+            if fxConn then fxConn:Disconnect() fxConn = nil end
+            if lightOriginal then
+                Lighting.GlobalShadows = lightOriginal.GlobalShadows
+                Lighting.FogEnd = lightOriginal.FogEnd
+                Lighting.FogStart = lightOriginal.FogStart
+                settings().Rendering.QualityLevel = lightOriginal.Quality
+            end
+            for v, was in pairs(postOriginal) do
+                if v and v.Parent and was ~= nil then v.Enabled = was end
+            end
+            for obj, was in pairs(fxOriginal) do
+                if obj and obj.Parent then obj.Enabled = was end
+            end
+            postOriginal, fxOriginal = {}, {}
+        end
+    end)
+end
+
+-- ========================
+-- MODO BATATA (materiais lisos, sem reflexo)
+-- ========================
+local matOriginal = setmetatable({}, {__mode = "k"})
+local batataToken = 0
+
+Features.Batata = function(state)
+    batataToken += 1
+    local myToken = batataToken
+
+    if state then
+        task.spawn(function()
+            local list = workspace:GetDescendants()
+            for i, obj in ipairs(list) do
+                if myToken ~= batataToken or not Running then return end
+                if obj:IsA("BasePart") and not obj:IsA("Terrain") then
+                    local parent = obj.Parent
+                    local isChar = parent and parent:FindFirstChildOfClass("Humanoid")
+                    if not isChar and not matOriginal[obj] then
+                        matOriginal[obj] = {obj.Material, obj.Reflectance}
+                        obj.Material = Enum.Material.SmoothPlastic
+                        obj.Reflectance = 0
+                    end
+                end
+                if i % 400 == 0 then task.wait() end
+            end
+        end)
+        pcall(function()
+            local t = workspace.Terrain
+            t.WaterWaveSize = 0
+            t.WaterWaveSpeed = 0
+            t.WaterReflectance = 0
+            t.WaterTransparency = 1
+        end)
+    else
+        task.spawn(function()
+            local n = 0
+            for obj, data in pairs(matOriginal) do
+                if obj and obj.Parent then
+                    pcall(function()
+                        obj.Material = data[1]
+                        obj.Reflectance = data[2]
+                    end)
+                end
+                matOriginal[obj] = nil
+                n += 1
+                if n % 400 == 0 then task.wait() end
+            end
+        end)
+        pcall(function()
+            local t = workspace.Terrain
+            t.WaterWaveSize = 0.15
+            t.WaterWaveSpeed = 10
+            t.WaterReflectance = 1
+            t.WaterTransparency = 0.3
+        end)
+    end
+end
+
+-- ========================
+-- OCULTAR ACESSÓRIOS DOS OUTROS (menos lag em servidor cheio)
+-- ========================
+local accOriginal = setmetatable({}, {__mode = "k"})
+local accLoop = false
+
+local function HideAccessories(hide)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            for _, acc in ipairs(plr.Character:GetChildren()) do
+                if acc:IsA("Accessory") then
+                    local handle = acc:FindFirstChild("Handle")
+                    if handle then
+                        if hide then
+                            if accOriginal[handle] == nil then
+                                accOriginal[handle] = handle.Transparency
+                            end
+                            handle.Transparency = 1
+                        elseif accOriginal[handle] ~= nil then
+                            handle.Transparency = accOriginal[handle]
+                            accOriginal[handle] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+Features.SemAcessorios = function(state)
+    accLoop = state
+    if state then
+        task.spawn(function()
+            while accLoop and Running do
+                pcall(HideAccessories, true)
+                task.wait(3)
+            end
+        end)
+    else
+        pcall(HideAccessories, false)
+    end
+end
+
+-- ========================
+-- OCULTAR NOMES
+-- ========================
+local nameLoop = false
+local function SetNames(hide)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                pcall(function()
+                    hum.DisplayDistanceType = hide and Enum.HumanoidDisplayDistanceType.None
+                        or Enum.HumanoidDisplayDistanceType.Viewer
+                end)
+            end
+        end
+    end
+end
+
+Features.SemNomes = function(state)
+    nameLoop = state
+    if state then
+        task.spawn(function()
+            while nameLoop and Running do
+                SetNames(true)
+                task.wait(3)
+            end
+        end)
+    else
+        SetNames(false)
+    end
+end
+
+-- ========================
+-- ANTI AFK
+-- ========================
+local afkConn = nil
+Features.AntiAFK = function(state)
+    if state then
+        afkConn = LocalPlayer.Idled:Connect(function()
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end)
+        end)
+    elseif afkConn then
+        afkConn:Disconnect()
+        afkConn = nil
+    end
+end
+
+-- ========================
+-- SILENCIAR SONS
+-- ========================
+local soundOriginal = {}
+Features.Mudo = function(state)
+    pcall(function()
+        if state then
+            soundOriginal = {}
+            for _, s in ipairs(workspace:GetDescendants()) do
+                if s:IsA("Sound") then
+                    soundOriginal[s] = s.Volume
+                    s.Volume = 0
+                end
+            end
+        else
+            for s, vol in pairs(soundOriginal) do
+                if s and s.Parent then s.Volume = vol end
+            end
+            soundOriginal = {}
+        end
+    end)
+end
+
+-- ========================
+-- GUI
+-- ========================
+local sg = Instance.new("ScreenGui")
+sg.Name = "TurboBrook"
+sg.ResetOnSpawn = false
+sg.Parent = guiParent
+
+-- ---------- HUD FPS / PING ----------
+local hud = Instance.new("Frame", sg)
+hud.Size = UDim2.new(0, 150, 0, 54)
+hud.Position = UDim2.new(0, 10, 0, 10)
+hud.BackgroundColor3 = C.bg
+hud.BackgroundTransparency = 0.15
+hud.Active = true
+hud.Draggable = true
+Instance.new("UICorner", hud).CornerRadius = UDim.new(0, 10)
+local hudStroke = Instance.new("UIStroke", hud)
+hudStroke.Color = C.accent
+hudStroke.Thickness = 1.2
+
+local fpsLabel = Instance.new("TextLabel", hud)
+fpsLabel.Size = UDim2.new(1, -16, 0, 24)
+fpsLabel.Position = UDim2.new(0, 8, 0, 3)
+fpsLabel.BackgroundTransparency = 1
+fpsLabel.Font = Enum.Font.GothamBold
+fpsLabel.TextSize = 16
+fpsLabel.TextXAlignment = Enum.TextXAlignment.Left
+fpsLabel.TextColor3 = C.good
+fpsLabel.Text = "FPS: --"
+
+local pingLabel = Instance.new("TextLabel", hud)
+pingLabel.Size = UDim2.new(1, -16, 0, 24)
+pingLabel.Position = UDim2.new(0, 8, 0, 27)
+pingLabel.BackgroundTransparency = 1
+pingLabel.Font = Enum.Font.GothamBold
+pingLabel.TextSize = 16
+pingLabel.TextXAlignment = Enum.TextXAlignment.Left
+pingLabel.TextColor3 = C.good
+pingLabel.Text = "PING: --"
+
+-- contador de FPS + leitura de ping
+local frames, lastTick = 0, os.clock()
+table.insert(Connections, RunService.RenderStepped:Connect(function()
+    frames += 1
+    local now = os.clock()
+    if now - lastTick >= 0.5 then
+        local fps = math.floor(frames / (now - lastTick) + 0.5)
+        frames, lastTick = 0, now
+
+        fpsLabel.Text = "FPS: " .. fps
+        fpsLabel.TextColor3 = fps >= 50 and C.good or (fps >= 30 and C.mid or C.bad)
+
+        local ping = 0
+        pcall(function()
+            ping = math.floor(Stats.Network.ServerStatsItem["Data Ping"]:GetValue() + 0.5)
+        end)
+        pingLabel.Text = "PING: " .. ping .. " ms"
+        pingLabel.TextColor3 = ping <= 80 and C.good or (ping <= 160 and C.mid or C.bad)
+    end
+end))
+
+-- ---------- PAINEL ----------
+local main = Instance.new("Frame", sg)
+main.Size = UDim2.new(0, 300, 0, 360)
+main.Position = UDim2.new(0.5, -150, 0.5, -180)
+main.BackgroundColor3 = C.bg
+main.Active = true
+main.Draggable = true
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color = C.accent
+mainStroke.Thickness = 1.2
+
+local header = Instance.new("Frame", main)
+header.Size = UDim2.new(1, 0, 0, 40)
+header.BackgroundColor3 = C.header
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 12)
+
+local title = Instance.new("TextLabel", header)
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "⚡ TURBO BROOK"
+title.TextColor3 = C.accent
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local closeBtn = Instance.new("TextButton", header)
+closeBtn.Size = UDim2.new(0, 28, 0, 28)
+closeBtn.Position = UDim2.new(1, -34, 0.5, -14)
+closeBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 13
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+closeBtn.MouseButton1Click:Connect(function() main.Visible = false end)
+
+local list = Instance.new("ScrollingFrame", main)
+list.Size = UDim2.new(1, -16, 1, -52)
+list.Position = UDim2.new(0, 8, 0, 46)
+list.BackgroundTransparency = 1
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 3
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 6)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local order = 0
+local function Row(h)
+    order += 1
+    local f = Instance.new("Frame", list)
+    f.Size = UDim2.new(1, -6, 0, h or 38)
+    f.BackgroundColor3 = C.row
+    f.LayoutOrder = order
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+    return f
+end
+
+local function Toggle(text, key)
+    local f = Row(38)
+
+    local label = Instance.new("TextLabel", f)
+    label.Size = UDim2.new(1, -64, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = C.text
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+
+    local btn = Instance.new("TextButton", f)
+    btn.Size = UDim2.new(0, 44, 0, 22)
+    btn.Position = UDim2.new(1, -54, 0.5, -11)
+    btn.BackgroundColor3 = C.off
+    btn.Text = ""
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
+
+    local dot = Instance.new("Frame", btn)
+    dot.Size = UDim2.new(0, 16, 0, 16)
+    dot.Position = UDim2.new(0, 3, 0.5, -8)
+    dot.BackgroundColor3 = Color3.fromRGB(190, 190, 190)
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    local state = false
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        btn.BackgroundColor3 = state and C.on or C.off
+        dot.Position = state and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
+        dot.BackgroundColor3 = state and Color3.new(1, 1, 1) or Color3.fromRGB(190, 190, 190)
+        pcall(Features[key], state)
+    end)
+end
+
+local function Button(text, callback)
+    local f = Row(38)
+    local btn = Instance.new("TextButton", f)
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text = text
+    btn.TextColor3 = C.accent
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 13
+    btn.MouseButton1Click:Connect(function()
+        callback(btn)
+    end)
+    return btn
+end
+
+-- Toggles
+Toggle("🚫 Anti Pulo", "AntiPulo")
+Toggle("🚀 Otimizar Jogo (sombras/efeitos)", "Otimizar")
+Toggle("🥔 Modo Batata (gráfico mínimo)", "Batata")
+Toggle("👒 Ocultar acessórios dos outros", "SemAcessorios")
+Toggle("🏷️ Ocultar nomes dos outros", "SemNomes")
+Toggle("🔇 Silenciar sons", "Mudo")
+Toggle("💤 Anti AFK", "AntiAFK")
+
+-- Limite de FPS (se o executor suportar)
+if setfpscap then
+    local caps = {60, 120, 240, 0}
+    local idx = 0
+    Button("🎯 Limite de FPS: padrão", function(btn)
+        idx = idx % #caps + 1
+        local cap = caps[idx]
+        pcall(setfpscap, cap)
+        btn.Text = "🎯 Limite de FPS: " .. (cap == 0 and "sem limite" or cap)
+    end)
+end
+
+-- Limpar memória
+Button("🧹 Limpar memória", function(btn)
+    pcall(function() collectgarbage("collect") end)
+    btn.Text = "✅ Memória limpa!"
+    task.delay(1.5, function()
+        if btn and btn.Parent then btn.Text = "🧹 Limpar memória" end
+    end)
+end)
+
+-- Descarregar tudo
+Button("❌ Descarregar script (restaura tudo)", function()
+    Running = false
+    for _, setter in pairs(Features) do
+        pcall(setter, false)
+    end
+    for _, conn in ipairs(Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    sg:Destroy()
+end)
+
+-- ---------- BOTÃO FLUTUANTE ----------
+local float = Instance.new("TextButton", sg)
+float.Size = UDim2.new(0, 46, 0, 46)
+float.Position = UDim2.new(0, 10, 0.5, -23)
+float.BackgroundColor3 = C.bg
+float.Text = "⚡"
+float.TextSize = 22
+float.TextColor3 = C.accent
+float.Active = true
+float.Draggable = true
+Instance.new("UICorner", float).CornerRadius = UDim.new(1, 0)
+local floatStroke = Instance.new("UIStroke", float)
+floatStroke.Color = C.accent
+floatStroke.Thickness = 1.5
+float.MouseButton1Click:Connect(function()
+    main.Visible = not main.Visible
+end)
+
+-- Tecla RightShift abre/fecha o painel no PC
+table.insert(Connections, UserInputService.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == Enum.KeyCode.RightShift then
+        main.Visible = not main.Visible
+    end
+end))
+
+print("⚡ TURBO BROOK carregado! Botão ⚡ ou RightShift abre o painel.")
